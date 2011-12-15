@@ -1,9 +1,11 @@
 from tornado import netutil
+from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
 from tornado.testing import AsyncHTTPTestCase, LogTrapTestCase, get_unused_port
 from tornado.util import b
 from tornado.web import RequestHandler, Application
 import socket
+import time
 
 class HelloHandler(RequestHandler):
     def get(self):
@@ -13,20 +15,21 @@ class TestIOStream(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
         return Application([('/', HelloHandler)])
 
-    def make_iostream_pair(self):
+    def make_iostream_pair(self, **kwargs):
         port = get_unused_port()
         [listener] = netutil.bind_sockets(port, '127.0.0.1',
                                           family=socket.AF_INET)
         streams = [None, None]
         def accept_callback(connection, address):
-            streams[0] = IOStream(connection, io_loop=self.io_loop)
+            streams[0] = IOStream(connection, io_loop=self.io_loop, **kwargs)
             self.stop()
         def connect_callback():
             streams[1] = client_stream
             self.stop()
         netutil.add_accept_handler(listener, accept_callback,
                                    io_loop=self.io_loop)
-        client_stream = IOStream(socket.socket(), io_loop=self.io_loop)
+        client_stream = IOStream(socket.socket(), io_loop=self.io_loop,
+                                 **kwargs)
         client_stream.connect(('127.0.0.1', port),
                               callback=connect_callback)
         self.wait(condition=lambda: all(streams))
@@ -54,6 +57,16 @@ class TestIOStream(AsyncHTTPTestCase, LogTrapTestCase):
         self.stream.read_bytes(3, self.stop)
         data = self.wait()
         self.assertEqual(data, b("200"))
+
+    def test_write_zero_bytes(self):
+        # Attempting to write zero bytes should run the callback without
+        # going into an infinite loop.
+        server, client = self.make_iostream_pair()
+        server.write(b(''), callback=self.stop)
+        self.wait()
+        # As a side effect, the stream is now listening for connection
+        # close (if it wasn't already), but is not listening for writes
+        self.assertEqual(server._state, IOLoop.READ|IOLoop.ERROR)
 
     def test_connection_refused(self):
         # When a connection is refused, the connect callback should not
@@ -157,6 +170,34 @@ class TestIOStream(AsyncHTTPTestCase, LogTrapTestCase):
             client.read_bytes(1, callback1)
             self.wait()  # stopped by close_callback
             self.assertEqual(chunks, [b("1"), b("2")])
+        finally:
+            server.close()
+            client.close()
+
+    def test_close_buffered_data(self):
+        # Similar to the previous test, but with data stored in the OS's
+        # socket buffers instead of the IOStream's read buffer.  Out-of-band
+        # close notifications must be delayed until all data has been
+        # drained into the IOStream buffer. (epoll used to use out-of-band
+        # close events with EPOLLRDHUP, but no longer)
+        #
+        # This depends on the read_chunk_size being smaller than the
+        # OS socket buffer, so make it small.
+        server, client = self.make_iostream_pair(read_chunk_size=256)
+        try:
+            server.write(b("A") * 512)
+            client.read_bytes(256, self.stop)
+            data = self.wait()
+            self.assertEqual(b("A") * 256, data)
+            server.close()
+            # Allow the close to propagate to the client side of the
+            # connection.  Using add_callback instead of add_timeout
+            # doesn't seem to work, even with multiple iterations
+            self.io_loop.add_timeout(time.time() + 0.01, self.stop)
+            self.wait()
+            client.read_bytes(256, self.stop)
+            data = self.wait()
+            self.assertEqual(b("A") * 256, data)
         finally:
             server.close()
             client.close()
