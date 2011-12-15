@@ -17,12 +17,19 @@
 """A lightweight wrapper around MySQLdb."""
 
 import copy
-import MySQLdb.constants
-import MySQLdb.converters
-import MySQLdb.cursors
 import itertools
 import logging
 import time
+from contextlib import contextmanager
+
+import MySQLdb.constants
+import MySQLdb.converters
+import MySQLdb.cursors
+
+
+class RollbackError(Exception):
+    pass
+
 
 class Connection(object):
     """A lightweight wrapper around MySQLdb DB-API connections.
@@ -178,6 +185,26 @@ class Connection(object):
         finally:
             cursor.close()
 
+    def transaction(self):
+        """
+        Context manager starting a MySQL transaction.
+
+        The transaction will automatically be committed when exiting the with
+        block.  To rollback, raise the `Rollback` exception.  All other
+        exceptions will cause a rollback, and be re-raised.
+
+        Example usage:
+            from tornado.database import Connection, RollbackError
+            db = Connection( ... )
+
+            with db.transaction():
+                db.execute('INSERT INTO some_table VALUES (some_value)')
+
+                # Oops, I changed my mind!
+                raise RollbackError
+        """
+        return self._transaction()
+
     def _ensure_connected(self):
         # Mysql by default closes client connections that are idle for
         # 8 hours, but the client library does not report this fact until
@@ -200,6 +227,23 @@ class Connection(object):
             logging.error("Error connecting to MySQL on %s", self.host)
             self.close()
             raise
+
+    @contextmanager
+    def _transaction(self):
+        """ Context manager for starting a MySQL transaction. """
+        try:
+            self._db.autocommit(False)
+            self.execute('START TRANSACTION')
+            yield
+        except RollbackError:
+            self._db.rollback()
+        except:
+            self._db.rollback()
+            raise
+        else:
+            self._db.commit()
+        finally:
+            self._db.autocommit(True)
 
 
 class Row(dict):
