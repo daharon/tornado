@@ -231,9 +231,10 @@ class Connection(object):
     @contextmanager
     def _transaction(self):
         """ Context manager for starting a MySQL transaction. """
+        cursor = self._cursor()
         try:
             self._db.autocommit(False)
-            self.execute('START TRANSACTION')
+            self._execute(cursor, 'START TRANSACTION', [])
             yield
         except RollbackError:
             self._db.rollback()
